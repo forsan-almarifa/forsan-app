@@ -1,0 +1,110 @@
+# بناء تطبيق «فرسان المعرفة» تلقائيًا على GitHub
+# يعمل وحده كلما رفعت ملفًا جديدًا:
+#   ١) يبني ملف APK لأندرويد ويضعه في صفحة Releases
+#   ٢) ينشر نسخة الويب (للآيفون) على GitHub Pages
+#      (تحتاج تفعيلًا مرة واحدة: Settings ← Pages ← Source: GitHub Actions)
+name: build-forsan-apk
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the repository files
+        uses: actions/checkout@v4
+
+      - name: Unpack the project zip
+        run: |
+          set -e
+          ZIP=$(ls *.zip 2>/dev/null | head -n 1)
+          if [ -z "$ZIP" ]; then echo "::error::No .zip file found in the repository (upload forsan-app.zip)"; exit 1; fi
+          echo "Using $ZIP"
+          rm -rf build-src && mkdir build-src
+          unzip -q -o "$ZIP" -d build-src
+          SETTINGS=$(find build-src -maxdepth 3 -name settings.gradle | head -n 1)
+          if [ -z "$SETTINGS" ]; then echo "::error::settings.gradle not found inside $ZIP"; exit 1; fi
+          echo "PROJ=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+
+      - name: Put the database link inside the app
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          proj = os.environ["PROJ"]
+          url = open("api-url.txt", encoding="utf-8-sig").read().strip() if os.path.exists("api-url.txt") else ""
+          url = url.split()[0] if url.split() else ""
+          if not url:
+              print("::error::api-url.txt is missing or empty - add the Apps Script link (ending with /exec) and the build will run again")
+              sys.exit(1)
+          if not re.match(r"^https://script\.google\.com/.+/exec$", url):
+              print("::warning::The link in api-url.txt should start with https://script.google.com/ and end with /exec")
+          path = os.path.join(proj, "app/src/main/assets/www/config.js")
+          src = open(path, encoding="utf-8").read().replace("__FORSAN_API_URL__", url)
+          open(path, "w", encoding="utf-8").write(src)
+          print("Database link:", url or "(empty)")
+          PY
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build the APK
+        working-directory: ${{ env.PROJ }}
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Name the APK
+        run: |
+          mkdir -p out
+          cp "$PROJ/app/build/outputs/apk/release/app-release.apk" out/forsan-almarifa.apk
+          ls -la out
+
+      - name: Prepare the web version (for iPhone)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.PROJ }}/app/src/main/assets/www
+
+      - name: Keep the APK with this build
+        uses: actions/upload-artifact@v4
+        with:
+          name: forsan-almarifa-apk
+          path: out/forsan-almarifa.apk
+
+      - name: Publish the APK on the Releases page
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: فرسان المعرفة 1.0.${{ github.run_number }}
+          body: ملف التطبيق forsan-almarifa.apk — نزّله على الجوال وثبّته.
+          files: out/forsan-almarifa.apk
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+
+  # نشر نسخة الويب — مهمة منفصلة، فلو لم تُفعَّل GitHub Pages يبقى ملف APK سليمًا
+  deploy-web:
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish the web version on GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
